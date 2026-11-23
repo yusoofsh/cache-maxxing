@@ -7,7 +7,7 @@ import type { Rec } from '../types'
 import { assembleBrief, briefPrompt, extractFacts, handoffPath, isValidBrief, parseSkill, savingsLine, seedLine, transcriptGuess } from './handoff'
 import type { Numbers } from './handoff'
 import { type Learned, PRICES_DATE, WAITING, isDevCopy, addStats, bundledPrices, costs, decide, fromSessionStart, haikuUsd, handoffSaving, newerVersion, priceOf, readSettings, compactPrefix, sendWarning, setLearned, setPriceOverride, statsFromTranscript, statsText, sumStats, ttlFor, ttlFromUsage, validatePrices } from './logic'
-import type { Stats } from './logic'
+import type { Settings, Stats } from './logic'
 
 const KEEP_MS = 7 * 24 * 60 * 60 * 1000 // saved chats older than this are pruned; an older chat refills on resume
 const STATS_KEEP_MS = 90 * 24 * 60 * 60 * 1000 // a chat's /cmaxx-stats counts (your call); then folded into st:retired
@@ -31,6 +31,7 @@ const hidden = atom({ plugin: 'cache-maxxing', key: 'hidden' } as const, false)
 // fresh chat, and the transcript path from the latest SessionStart.
 let pendingSeed: { line: string; at: number } | undefined
 let transcriptPath: string | undefined
+let currentSettings: Settings = readSettings({})
 let isNewChat = false // the next main reply is a fresh chat's first: its cache write is a fresh start's size
 let compactSummary: number | undefined // the last /compact's summary tokens (chars / 4), until the next main request measures what came back with it
 let savedFor: number | undefined // the expired cache a handoff saving was counted for: a second handoff of it saves nothing more
@@ -173,8 +174,44 @@ async function loadPrices($: EngineInterface) {
   setPriceOverride('error' in v || v.sourceDate <= PRICES_DATE ? null : v.prices)
 }
 
+// What a chat start does. Registered on `classic.SessionStart` and, as a fallback, called from
+// `session.start`: a managed host's outermost plugin (cc-plugin-sec-default) forwards `classic.*`
+// events past user-tier plugins, so the classic hook may never run. Every step is safe to run twice.
+type StartEvent = { source?: string; session_id?: string; transcript_path?: string; seconds_since_last_response?: number; context_tokens?: number; model?: string }
+async function startChat($: EngineInterface, e: StartEvent) {
+  const settings = currentSettings
+    if (e.transcript_path) transcriptPath = e.transcript_path
+    isNewChat = (e.source === 'startup' || e.source === 'clear') && typeof e.seconds_since_last_response !== 'number'
+    if (e.session_id) await fillIn($, e.session_id, e.transcript_path, ttlFor(settings.memoryMinutes), e.source === 'fork').catch(() => {})
+    if (e.source === 'clear') {
+      await save($, null, e.session_id)
+      // the fresh chat a /cmaxx-handoff opened: put the line in its box; sending stays the user's
+      const seed = pendingSeed
+      pendingSeed = undefined
+      if (seed && (await $.clock.now()) - seed.at < SEED_MS) {
+        const line = seed.line
+        void $.prompt.fill({ text: line })
+          .then(f => (f.isFilled ? undefined : copyOrSay($, line)))
+          .catch(() => copyOrSay($, line))
+      }
+    } else if (typeof e.seconds_since_last_response === 'number' && e.context_tokens) {
+      const now = await $.clock.now()
+      const prev = await read($, last)
+      const candidate = fromSessionStart({
+        secondsSince: e.seconds_since_last_response,
+        contextTokens: e.context_tokens,
+        model: e.model ?? (await $.session.model()),
+        window: (await $.session.usage()).context.window || undefined,
+      }, now, prev, settings)
+      await adopt($, candidate, e.session_id)
+    } else {
+      await adopt($, null, e.session_id)
+    }
+}
+
 export const register: Register = (on, options) => {
   const settings = readSettings(options as Record<string, unknown>)
+  currentSettings = settings
 
   on('session.start', async ($, e, next) => {
     isInteractive = e.isInteractive !== false
@@ -204,39 +241,17 @@ export const register: Register = (on, options) => {
     await loadPrices($).catch(() => {})
     for (const k of ['fresh', 'brief', 'haiku', 'compact'] as const) setLearned(k, await $.store.get(k).catch(() => undefined))
     await adopt($, null).catch(() => {}) // bring back this chat's saved record (app restart, reload)
+    // fallback for a skipped classic.SessionStart: the fields the engine event carries, if any
+    const ev = e as StartEvent
+    const id = ev.session_id ?? (await $.session.id().catch(() => undefined))
+    if (id) await startChat($, { ...ev, session_id: id }).catch(() => {})
     return next(e)
   })
 
   // Older chats and chats resumed inside a running app: Claude Code says how long
   // ago the last reply was and how big the chat is, so the bar can show at once.
   on('classic.SessionStart', async ($, e, next) => {
-    if (e.transcript_path) transcriptPath = e.transcript_path
-    isNewChat = (e.source === 'startup' || e.source === 'clear') && typeof e.seconds_since_last_response !== 'number'
-    if (e.session_id) await fillIn($, e.session_id, e.transcript_path, ttlFor(settings.memoryMinutes), e.source === 'fork').catch(() => {})
-    if (e.source === 'clear') {
-      await save($, null, e.session_id)
-      // the fresh chat a /cmaxx-handoff opened: put the line in its box; sending stays the user's
-      const seed = pendingSeed
-      pendingSeed = undefined
-      if (seed && (await $.clock.now()) - seed.at < SEED_MS) {
-        const line = seed.line
-        void $.prompt.fill({ text: line })
-          .then(f => (f.isFilled ? undefined : copyOrSay($, line)))
-          .catch(() => copyOrSay($, line))
-      }
-    } else if (typeof e.seconds_since_last_response === 'number' && e.context_tokens) {
-      const now = await $.clock.now()
-      const prev = await read($, last)
-      const candidate = fromSessionStart({
-        secondsSince: e.seconds_since_last_response,
-        contextTokens: e.context_tokens,
-        model: e.model ?? (await $.session.model()),
-        window: (await $.session.usage()).context.window || undefined,
-      }, now, prev, settings)
-      await adopt($, candidate, e.session_id)
-    } else {
-      await adopt($, null, e.session_id)
-    }
+    await startChat($, e)
     return next(e)
   }).catch(($, e, next) => next(e)) // fail open: never get in Claude Code's way
 
@@ -271,7 +286,9 @@ export const register: Register = (on, options) => {
       }
       // a reply sent after this chat's cache expired or was reset paid for a rebuild: its cache write.
       // Reading under half the last prefix while warm: something reset it with no event (effort, tools, cleared images; issue #5)
-      const isRebuild = !!prev && (!!prev.resetBy || startedAt > prev.at + prev.ttlMin * 60_000 || u.cache_read_input_tokens < prev.prefix / 2)
+      // the model changed with no PostModelSwitch event (the classic hook may be skipped): a new model starts a cold cache
+      const isModelSwitch = !!prev && !!prev.model && !!u.model && prev.model !== u.model
+      const isRebuild = !!prev && (!!prev.resetBy || isModelSwitch || startedAt > prev.at + prev.ttlMin * 60_000 || u.cache_read_input_tokens < prev.prefix / 2)
       const p = priceOf(u.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
       const writeUsd = p ? (u.cache_creation_input_tokens * p.input * (ttlMin >= 60 ? 2 : 1.25)) / 1e6 : 0
       await count($, {
